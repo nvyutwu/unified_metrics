@@ -492,26 +492,46 @@ SGLang also tracks `routing_keys_active` (Gauge) — the number of unique routin
 
 ## 9. Request Type Counters
 
-Both frameworks track request types for multi-modal and structured output workloads. These are incremented in the chat serving handler (`serving_chat.py`) via a `_classify_chat_request()` function that inspects the incoming request at the `/v1/chat/completions` endpoint.
+Both frameworks track request types for multi-modal and structured output workloads. These counters are defined in a shared module (`request_metrics.py`) and incremented across **all three API endpoints**: `/v1/chat/completions`, `/v1/completions`, and `/v1/responses`.
 
 ### Metrics
 
 | Metric Name | Type | Description | Present In |
 |-------------|------|-------------|------------|
-| `request_type_image_total` | Counter | Requests containing `image_url` content parts | Both |
+| `request_type_image_total` | Counter | Requests containing images | Both |
 | `request_type_video_total` | Counter | Requests containing `video_url` content parts | Both |
 | `request_type_tool_call_total` | Counter | Requests with `tools` defined and `tool_choice != "none"` | Both |
 | `request_type_structured_output_total` | Counter | Requests using any structured output method | Both |
 
+### API Endpoint Coverage
+
+| Counter | Chat (`/v1/chat/completions`) | Completions (`/v1/completions`) | Responses (`/v1/responses`) |
+|---------|------|-------------|-----------|
+| `request_type_image_total` | SGLang + vLLM (`image_url` parts) | N/A | SGLang + vLLM (`input_image` items) |
+| `request_type_video_total` | SGLang + vLLM (`video_url` parts) | N/A | N/A (not supported by Responses API) |
+| `request_type_tool_call_total` | SGLang + vLLM | N/A | SGLang + vLLM |
+| `request_type_structured_output_total` | SGLang + vLLM | SGLang + vLLM | vLLM only (`text.format`) |
+
+**Notes**:
+- Completions API does not support images, videos, or tool calls in either framework.
+- SGLang's Responses API does not support structured output (`text.format` / `response_format`), so the structured output counter is vLLM-only for responses.
+- The Responses API does not support video input in either framework (no `input_video` type in the OpenAI Responses API spec).
+
 ### Classification Logic
 
-#### Image / Video
+#### Image
 
-Both frameworks iterate over `request.messages[*].content` parts and check `part.type == "image_url"` or `"video_url"`. Each counter increments at most once per request (flags, not per-part counts).
+- **Chat**: Both iterate over `request.messages[*].content` parts and check `part.type == "image_url"`.
+- **Responses**: Both check `request.input` items for top-level `input_image` type or nested `input_image`/`image_url` in message content parts.
+- Each counter increments at most once per request (flags, not per-part counts).
+
+#### Video
+
+- **Chat only**: Both check `part.type == "video_url"` in message content parts.
 
 #### Tool Call
 
-Both use identical logic:
+Both use identical logic across chat and responses:
 ```python
 if request.tools and request.tool_choice != "none":
 ```
@@ -530,6 +550,7 @@ Both frameworks now cover all structured output methods:
 | `ebnf` / `grammar` | ✓ (top-level `request.ebnf` field) | ✓ (via `request.structured_outputs`) |
 | `choice` | N/A (not a SGLang chat field) | ✓ (via `request.structured_outputs`) |
 | `json` (extra_body) | N/A (SGLang uses `response_format`) | ✓ (via `request.structured_outputs`) |
+| `text.format` (Responses API) | N/A (not supported in SGLang) | ✓ (`json_schema`, `json_object`) |
 
 **API design difference**: SGLang exposes structured output options as top-level request fields (`regex`, `ebnf`), while vLLM uses `extra_body={"structured_outputs": {...}}` which maps to a `StructuredOutputsParams` object.
 
@@ -779,7 +800,10 @@ For consistent P50/P99 calculations across frameworks, align bucket boundaries f
 | `python/sglang/srt/managers/tokenizer_manager.py` | Recording logic for request-level metrics |
 | `python/sglang/srt/managers/scheduler_metrics_mixin.py` | Scheduler-level metrics recording |
 | `python/sglang/srt/utils/common.py` | HTTP-level metrics middleware |
-| `python/sglang/srt/entrypoints/openai/serving_chat.py` | Chat serving handler (request type counters) |
+| `python/sglang/srt/entrypoints/openai/request_metrics.py` | Shared request type counters and classification functions |
+| `python/sglang/srt/entrypoints/openai/serving_chat.py` | Chat serving handler |
+| `python/sglang/srt/entrypoints/openai/serving_completions.py` | Completions serving handler |
+| `python/sglang/srt/entrypoints/openai/serving_responses.py` | Responses serving handler |
 | `docs/references/production_metrics.md` | Official documentation |
 
 ### vLLM
@@ -789,6 +813,9 @@ For consistent P50/P99 calculations across frameworks, align bucket boundaries f
 | `vllm/v1/metrics/stats.py` | Stats data structures |
 | `vllm/v1/metrics/prometheus.py` | Prometheus setup |
 | `vllm/v1/spec_decode/metrics.py` | Speculative decoding metrics |
-| `vllm/entrypoints/openai/chat_completion/serving.py` | Chat serving handler (request type counters) |
+| `vllm/entrypoints/openai/request_metrics.py` | Shared request type counters and classification functions |
+| `vllm/entrypoints/openai/chat_completion/serving.py` | Chat serving handler |
+| `vllm/entrypoints/openai/completion/serving.py` | Completions serving handler |
+| `vllm/entrypoints/openai/responses/serving.py` | Responses serving handler |
 | `vllm/entrypoints/serve/instrumentator/metrics.py` | HTTP-level metrics (`prometheus_fastapi_instrumentator`) |
 | `vllm/config/*.py` | Config info metric labels |
