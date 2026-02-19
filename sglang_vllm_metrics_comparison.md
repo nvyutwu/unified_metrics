@@ -492,16 +492,61 @@ SGLang also tracks `routing_keys_active` (Gauge) — the number of unique routin
 
 ## 9. Request Type Counters
 
-Both frameworks track request types for multi-modal and structured output workloads:
+Both frameworks track request types for multi-modal and structured output workloads. These are incremented in the chat serving handler (`serving_chat.py`) via a `_classify_chat_request()` function that inspects the incoming request at the `/v1/chat/completions` endpoint.
+
+### Metrics
 
 | Metric Name | Type | Description | Present In |
 |-------------|------|-------------|------------|
-| `request_type_image_total` | Counter | Requests containing image inputs | Both |
-| `request_type_video_total` | Counter | Requests containing video inputs | Both |
-| `request_type_tool_call_total` | Counter | Requests using tool/function calling | Both |
-| `request_type_structured_output_total` | Counter | Requests using structured output (JSON schema, regex, etc.) | Both |
+| `request_type_image_total` | Counter | Requests containing `image_url` content parts | Both |
+| `request_type_video_total` | Counter | Requests containing `video_url` content parts | Both |
+| `request_type_tool_call_total` | Counter | Requests with `tools` defined and `tool_choice != "none"` | Both |
+| `request_type_structured_output_total` | Counter | Requests using any structured output method | Both |
 
-These are incremented in the chat serving handler (`serving_chat.py` in both codebases) based on request content analysis.
+### Classification Logic
+
+#### Image / Video
+
+Both frameworks iterate over `request.messages[*].content` parts and check `part.type == "image_url"` or `"video_url"`. Each counter increments at most once per request (flags, not per-part counts).
+
+#### Tool Call
+
+Both use identical logic:
+```python
+if request.tools and request.tool_choice != "none":
+```
+This counts requests that **enable** tool calling (tools defined + not explicitly disabled). It does NOT count whether the model actually invoked a tool.
+
+#### Structured Output
+
+Both frameworks now cover all structured output methods:
+
+| Method | SGLang | vLLM |
+|--------|--------|------|
+| `response_format: json_schema` | ✓ (via `response_format.type` check) | ✓ (via `response_format.type` check) |
+| `response_format: json_object` | ✓ (via `response_format.type` check) | ✓ (via `response_format.type` check) |
+| `response_format: structural_tag` | ✓ (via `response_format.type` check) | ✓ (via `response_format.type` check) |
+| `regex` | ✓ (top-level `request.regex` field) | ✓ (via `request.structured_outputs`) |
+| `ebnf` / `grammar` | ✓ (top-level `request.ebnf` field) | ✓ (via `request.structured_outputs`) |
+| `choice` | N/A (not a SGLang chat field) | ✓ (via `request.structured_outputs`) |
+| `json` (extra_body) | N/A (SGLang uses `response_format`) | ✓ (via `request.structured_outputs`) |
+
+**API design difference**: SGLang exposes structured output options as top-level request fields (`regex`, `ebnf`), while vLLM uses `extra_body={"structured_outputs": {...}}` which maps to a `StructuredOutputsParams` object.
+
+### SGLang Grammar Metrics (Engine-Level, Distinct from Request Type Counters)
+
+SGLang has additional **engine-level** grammar metrics that are separate from the chat-level `request_type_structured_output_total`:
+
+| Metric | Type | Layer | Description |
+|--------|------|-------|-------------|
+| `num_so_requests_total` | Counter | Tokenizer Manager | All requests with grammar at completion (any endpoint, not just chat) |
+| `num_grammar_total` | Counter | Scheduler | Grammar compilation events (internal engine operations) |
+| `num_grammar_queue_reqs` | Gauge | Scheduler | Current grammar queue depth (live snapshot) |
+| `num_grammar_cache_hit_total` | Counter | Scheduler | Grammar cache hits |
+| `num_grammar_aborted_total` | Counter | Scheduler | Aborted grammar requests |
+| `num_grammar_timeout_total` | Counter | Scheduler | Grammar timeouts |
+
+**Key distinction**: `request_type_structured_output_total` fires at the HTTP/chat entrypoint when a request arrives. `num_so_requests_total` fires at the backend when a request with grammar completes (covers all endpoints: `/generate`, `/v1/completions`, `/v1/chat/completions`). `num_grammar_total` counts grammar engine operations, not user requests.
 
 ---
 
