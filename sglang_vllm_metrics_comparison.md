@@ -154,20 +154,64 @@ These metrics exist in both frameworks on the `feat/unified-metrics` branches wi
 
 ### PD Disaggregation (Prefill-Decode Separation)
 
+Both frameworks support PD disaggregation but use **fundamentally different architectures**, which is reflected in their metrics.
+
+**SGLang** uses an explicit **4-queue pipeline** in the scheduler:
+```
+Prefill: bootstrap_queue → waiting_queue → inflight_queue → done
+Decode:  prealloc_queue → transfer_queue → waiting_queue → done
+```
+Metrics are generic (scheduler-level), independent of the KV transfer backend.
+
+**vLLM** uses **connector hooks** integrated into the forward pass:
+```
+Scheduler → start_load_kv() → wait_for_layer_load() → save_kv_layer() → wait_for_save()
+```
+Metrics are per-connector (each connector defines its own via `build_prom_metrics()`). The NIXL connector is the most instrumented.
+
+#### Queue Depth Metrics (SGLang-only, no vLLM equivalent)
+
+These metrics have no vLLM equivalent because vLLM's disaggregation does not use explicit queues.
+
 | Metric Name | Type | Description |
 |-------------|------|-------------|
-| `num_prefill_prealloc_queue_reqs` | Gauge | Prefill prealloc queue depth |
-| `num_prefill_inflight_queue_reqs` | Gauge | Prefill inflight queue depth |
-| `num_decode_prealloc_queue_reqs` | Gauge | Decode prealloc queue depth |
-| `num_decode_transfer_queue_reqs` | Gauge | Decode transfer queue depth |
-| `kv_transfer_speed_gb_s` | Gauge | KV transfer bandwidth (GB/s) |
-| `kv_transfer_latency_ms` | Gauge | KV transfer latency (ms) |
-| `kv_transfer_bootstrap_ms` | Gauge | KV transfer bootstrap time (ms) |
-| `kv_transfer_alloc_ms` | Gauge | KV transfer allocation wait (ms) |
-| `kv_transfer_total_mb` | Gauge | Total KV transferred (MB) |
-| `num_bootstrap_failed_reqs_total` | Counter | Bootstrap failures |
-| `num_transfer_failed_reqs_total` | Counter | Transfer failures |
-| `num_prefill_retries_total` | Counter | Prefill retries |
+| `num_prefill_prealloc_queue_reqs` | Gauge | Prefill bootstrap queue depth |
+| `num_prefill_inflight_queue_reqs` | Gauge | Prefill inflight (transfer in progress) queue depth |
+| `num_decode_prealloc_queue_reqs` | Gauge | Decode preallocation queue depth |
+| `num_decode_transfer_queue_reqs` | Gauge | Decode transfer (receiving KV) queue depth |
+
+#### KV Transfer Performance (overlap exists)
+
+| Concept | SGLang Metric | Type | vLLM Metric (NIXL) | Type | Notes |
+|---------|---------------|------|---------------------|------|-------|
+| Transfer speed | `kv_transfer_speed_gb_s` | Gauge | `kv_transfer_speed_gb_s` | Gauge | **Exact match** (vLLM explicitly SGLang-compatible) |
+| Transfer latency | `kv_transfer_latency_ms` | Gauge | `nixl_xfer_time_seconds` | Histogram | vLLM more detailed (histogram vs gauge), different unit |
+| Bytes transferred | `kv_transfer_total_mb` | Gauge | `nixl_bytes_transferred` | Histogram | vLLM more detailed (histogram vs gauge), raw bytes |
+| Bootstrap/post time | `kv_transfer_bootstrap_ms` | Gauge | `nixl_post_time_seconds` | Histogram | Similar concept, different granularity |
+| Alloc wait time | `kv_transfer_alloc_ms` | Gauge | — | — | No vLLM equivalent |
+
+#### Failure & Retry Counters
+
+| Concept | SGLang Metric | vLLM Metric (NIXL) | Notes |
+|---------|---------------|---------------------|-------|
+| Transfer failures | `num_transfer_failed_reqs_total` | `nixl_num_failed_transfers` | Similar semantics |
+| Bootstrap failures | `num_bootstrap_failed_reqs_total` | — | No vLLM equivalent (no separate bootstrap phase) |
+| Prefill retries | `num_prefill_retries_total` | — | No vLLM equivalent (uses recompute/fail policy instead) |
+| Failed notifications | — | `nixl_num_failed_notifications` | vLLM/NIXL-specific |
+| KV expiration | — | `nixl_num_kv_expired_reqs` | vLLM/NIXL-specific |
+
+#### vLLM NIXL-Specific Metrics (no SGLang equivalent)
+
+| Metric Name | Type | Description |
+|-------------|------|-------------|
+| `nixl_post_time_seconds` | Histogram | Post-transfer processing time |
+| `nixl_num_descriptors` | Histogram | Number of descriptors per transfer |
+| `nixl_num_failed_notifications` | Counter | Failed NIXL notifications |
+| `nixl_num_kv_expired_reqs` | Counter | Requests with expired KV (tracked on P instance) |
+
+#### Architecture Impact on Unification
+
+The queue depth gauges cannot be added to vLLM without redesigning its disaggregation architecture. The transfer performance and failure metrics have partial overlap — `kv_transfer_speed_gb_s` is already unified, but the remaining vLLM metrics are NIXL-specific (prefixed `nixl_*`) rather than generic. Adding generic transfer gauges (`kv_transfer_latency_ms`, `kv_transfer_total_mb`) to vLLM would be moderate effort — the data exists in `NixlKVConnectorStats` but would need to be surfaced as connector-agnostic metrics.
 
 ### Retraction Detail
 
@@ -312,6 +356,19 @@ These metrics exist in both frameworks on the `feat/unified-metrics` branches wi
 | Metric Name | Type | Description |
 |-------------|------|-------------|
 | `lora_requests_info` | Gauge | LoRA request info with adapter names |
+
+### PD Disaggregation — NIXL Connector (see also §3 for cross-framework comparison)
+
+| Metric Name | Type | Description |
+|-------------|------|-------------|
+| `nixl_xfer_time_seconds` | Histogram | Transfer duration per NIXL KV cache transfer |
+| `nixl_post_time_seconds` | Histogram | Post-transfer processing time |
+| `nixl_bytes_transferred` | Histogram | Bytes transferred per transfer |
+| `nixl_num_descriptors` | Histogram | Number of descriptors per transfer |
+| `nixl_num_failed_transfers` | Counter | Failed NIXL transfers |
+| `nixl_num_failed_notifications` | Counter | Failed NIXL notifications |
+| `nixl_num_kv_expired_reqs` | Counter | Requests with expired KV (P instance) |
+| `kv_transfer_speed_gb_s` | Gauge | KV transfer speed in GB/s (SGLang-compatible) |
 
 ### Config
 
@@ -757,7 +814,7 @@ Some SGLang metrics are **only recorded when using streaming requests** (`stream
 | Priority | Gap | Description | Impact |
 |----------|-----|-------------|--------|
 | **P1** | Grammar/SO metrics (11 metrics) | Grammar compilation, cache hits, timeouts | Structured output monitoring |
-| **P1** | PD disaggregation metrics (12 metrics) | Prefill/decode queue depths, KV transfer | Disaggregated serving monitoring |
+| **P1** | PD disaggregation queue depths (4 gauges) | Prefill/decode queue depths — no vLLM equivalent due to architectural difference (see §3) | Disaggregated serving monitoring |
 | **P2** | `gpu_execution_seconds_total` | GPU execution time tracking | GPU utilization analysis |
 | **P2** | Retraction token counters (input/output) | `num_retracted_input_tokens_total`, `num_retracted_output_tokens_total` | Memory pressure debugging |
 | **P2** | GPU cache eviction metrics | Eviction/load-back duration and counts | Tiered cache performance |
