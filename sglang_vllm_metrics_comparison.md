@@ -329,57 +329,30 @@ These metrics exist in both frameworks on the `feat/unified-metrics` branches wi
 
 ## 5. Detailed Computation Differences
 
-### End-to-End Request Latency (`e2e_request_latency_seconds`)
+All core latency metrics are now **aligned** across both frameworks on the `feat/unified-metrics` branches. They use the same formula (different variable names for the same timestamps).
 
-| Framework | Computation |
-|-----------|-------------|
-| **SGLang** | `finished_time - created_time` |
-| **vLLM** | `iteration_timestamp - arrival_time` |
+### Aligned Latency Metrics
 
-**Verdict**: **EQUIVALENT** — Both measure total time from request arrival to completion.
+| Metric | Unified Formula | SGLang Variables | vLLM Variables |
+|--------|----------------|-----------------|----------------|
+| `e2e_request_latency_seconds` | `end_time - arrival_time` | `finished_time - created_time` | `iteration_timestamp - arrival_time` |
+| `time_to_first_token_seconds` | `first_token_time - arrival_time` | `first_token_time - created_time` | `iteration_timestamp - arrival_time` (at first token) |
+| `request_queue_time_seconds` | `scheduled_time - queued_time` | `forward_entry_time - wait_queue_entry_time` | `scheduled_ts - queued_ts` |
+| `request_prefill_time_seconds` | `first_token_time - scheduled_time` | `first_token_time_perf - forward_entry` | `first_token_ts - scheduled_ts` |
+| `request_decode_time_seconds` | `end_time - first_token_time` | `finished_time_perf - first_token_time_perf` | `last_token_ts - first_token_ts` |
+| `request_inference_time_seconds` | `end_time - scheduled_time` | `finished_time_perf - forward_entry` | `last_token_ts - scheduled_ts` |
+| `request_time_per_output_token_seconds` | `decode_time / (gen_tokens - 1)` | Same | Same |
 
-### Time to First Token (`time_to_first_token_seconds`)
+### Inter-Token Latency (remaining difference)
 
-| Framework | Computation |
-|-----------|-------------|
-| **SGLang** | `first_token_time - created_time` |
-| **vLLM** | `iteration_timestamp - arrival_time` (when first token is generated) |
+| Framework | Computation | Notes |
+|-----------|-------------|-------|
+| **SGLang** | `(new_time - last_time) / num_new_tokens` | Normalizes when multiple tokens arrive together |
+| **vLLM** | `engine_core_timestamp - last_token_ts` | Measures individual inter-token gaps |
 
-**Verdict**: **EQUIVALENT** — Both measure time from request creation/arrival to first token generation.
+This is the one remaining computation difference. SGLang normalizes by `num_new_tokens` when batched token delivery occurs; vLLM measures each gap individually. Both now also provide the per-request mean TPOT via `request_time_per_output_token_seconds` which is computed identically.
 
-### Inter-Token Latency / Time Per Output Token
-
-| Framework | Metric Name | Computation | Notes |
-|-----------|-------------|-------------|-------|
-| **SGLang** | `inter_token_latency_seconds` | `(new_time - last_time) / num_new_tokens` | Normalizes per token in batch updates |
-| **vLLM** | `inter_token_latency_seconds` | `engine_core_timestamp - last_token_ts` | Time between consecutive tokens |
-| **Both** | `request_time_per_output_token_seconds` | `decode_time / (gen_tokens - 1)` | Per-request mean |
-
-**Differences**:
-- SGLang normalizes by `num_new_tokens` when multiple tokens arrive together
-- vLLM tracks individual inter-token gaps
-- Both now provide the per-request mean TPOT via `request_time_per_output_token_seconds`
-
-### Queue Time (`request_queue_time_seconds`)
-
-| Framework | Computation |
-|-----------|-------------|
-| **SGLang** | `forward_entry_time - wait_queue_entry_time` |
-| **vLLM** | `scheduled_ts - queued_ts` |
-
-**Verdict**: **EQUIVALENT** — Both measure time spent waiting before entering the running state.
-
-### Prefill and Decode Time (now unified)
-
-| Metric | SGLang Computation | vLLM Computation |
-|--------|-------------------|------------------|
-| `request_prefill_time_seconds` | `first_token_time - scheduled_time` | `first_token_ts - scheduled_ts` |
-| `request_decode_time_seconds` | `finished_time - first_token_time` | `last_token_ts - first_token_ts` |
-| `request_inference_time_seconds` | `finished_time - scheduled_time` | `last_token_ts - scheduled_ts` |
-
-**Verdict**: **EQUIVALENT** — Both compute phase breakdowns identically.
-
-### Cache Hit Rate
+### Cache Hit Rate (different approach, by design)
 
 | Framework | Method | Notes |
 |-----------|--------|-------|
@@ -392,6 +365,8 @@ These metrics exist in both frameworks on the `feat/unified-metrics` branches wi
 |-----------|--------|-------|
 | **SGLang** | `num_generated_tokens / gap_latency` | Computed in scheduler process |
 | **vLLM** | `accumulated_tokens / delta_time` (every ~5s) | Computed in frontend process |
+
+Both compute tokens/second over a sliding window. The implementation differs due to architecture (SGLang: multi-process, vLLM: single frontend process) but the semantics are the same.
 
 ---
 
@@ -517,9 +492,11 @@ Both frameworks expose configuration as info-style gauges (value always 1.0) wit
 | `model` | Yes | Yes |
 | `served_model_name` | Yes | Yes |
 | `dtype` | Yes | Yes |
-| `max_total_tokens` / `max_model_len` | `max_total_tokens` | `max_model_len` |
+| `max_model_len` | Yes (`context_length`) | Yes |
+| `max_total_tokens` | Yes | No (vLLM-specific: see `cache_config_info`) |
+| `max_output_length` | Yes | No (vLLM uses `max_new_tokens` in generation_config) |
 | `quantization` | Yes | Yes |
-| `enforce_eager` | No | Yes |
+| `enforce_eager` | Yes (`disable_cuda_graph`) | Yes |
 | `gpu_type` | Yes | Yes |
 
 ### `parallel_config_info`
@@ -542,6 +519,24 @@ Both frameworks expose configuration as info-style gauges (value always 1.0) wit
 | `spec_num_steps` | Yes | No |
 | `spec_eagle_topk` | Yes | No |
 | `spec_draft_model` | Yes | Yes |
+
+### `detailed_config_info` (NEW — both frameworks)
+
+Bundles scheduler, compilation, attention, and environment settings into a single info gauge.
+
+| Label | SGLang | vLLM |
+|-------|--------|------|
+| `stream_interval` | Yes | Yes |
+| `attention_backend` | Yes | Yes |
+| `sampling_backend` | Yes | No |
+| `grammar_backend` | Yes | No |
+| `chunked_prefill_size` | Yes | No |
+| `schedule_policy` | Yes | No |
+| `compilation_mode` | No | Yes |
+| `compilation_backend` | No | Yes |
+| `cudagraph_mode` | No | Yes |
+| `flash_attn_version` | No | Yes |
+| `flashinfer_moe_backend` | No | Yes |
 
 ### `cache_config_info` (vLLM-only)
 
