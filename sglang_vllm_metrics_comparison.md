@@ -73,7 +73,7 @@ These metrics exist in both frameworks on the `feat/unified-metrics` branches wi
 | Metric Name | SGLang | vLLM | Match? |
 |-------------|--------|------|--------|
 | `request_success_total` (SGLang) / `request_success` (vLLM) | Counter w/ `finished_reason` | Counter w/ `finished_reason` | **YES** |
-| `num_preemptions_total` (SGLang) / `num_preemptions` (vLLM) | Counter | Counter | **YES** (name differs by `_total` suffix) |
+| `num_retracted_requests_total` | Counter | Counter | **YES** (unified name for preemption/retraction count) |
 
 ### Queue/Load Gauges
 
@@ -169,15 +169,15 @@ These metrics exist in both frameworks on the `feat/unified-metrics` branches wi
 | `num_transfer_failed_reqs_total` | Counter | Transfer failures |
 | `num_prefill_retries_total` | Counter | Prefill retries |
 
-### Retraction Detail (more granular than vLLM)
+### Retraction Detail
 
-| Metric Name | Type | Description |
-|-------------|------|-------------|
-| `num_retracted_requests_total` | Counter | Retracted request count |
-| `num_retracted_input_tokens_total` | Counter | Input tokens from retracted requests |
-| `num_retracted_output_tokens_total` | Counter | Output tokens from retracted requests |
-| `num_retractions` | Histogram | Retraction count distribution per request |
-| `num_retracted_reqs` | Gauge | Current retracted count (snapshot) |
+| Metric Name | Type | SGLang | vLLM | Notes |
+|-------------|------|--------|------|-------|
+| `num_retracted_requests_total` | Counter | **YES** | **YES** | Unified name (was `num_preemptions_total` in vLLM) |
+| `num_retractions` | Histogram | **YES** | **YES** | Per-request preemption count distribution, same buckets |
+| `num_retracted_input_tokens_total` | Counter | **YES** | No | Input tokens wasted by retraction |
+| `num_retracted_output_tokens_total` | Counter | **YES** | No | Output tokens wasted by retraction |
+| `num_retracted_reqs` | Gauge | **YES** | No | Current retracted count (snapshot) |
 
 ### Cache Eviction
 
@@ -456,13 +456,37 @@ Both compute tokens/second over a sliding window. The implementation differs due
 
 ## 8. HTTP-Level Metrics
 
-Both frameworks expose HTTP server-level metrics via `common.py` / middleware:
+Both frameworks expose HTTP server-level metrics, but via **different mechanisms**:
 
-| Metric Name | Type | Description | Present In |
-|-------------|------|-------------|------------|
-| `http_request_duration_seconds` | Histogram | HTTP request duration by method/path/status | Both |
+- **SGLang**: Custom FastAPI middleware in `python/sglang/srt/utils/common.py` (`add_prometheus_track_response_middleware`)
+- **vLLM**: `prometheus_fastapi_instrumentator` library in `vllm/entrypoints/serve/instrumentator/metrics.py`
 
-SGLang defines this in `python/sglang/srt/openai_api/common.py`; vLLM in its serving middleware. Both label by `method`, `path`, and `status_code`.
+### Comparison
+
+| Metric | SGLang | vLLM |
+|--------|--------|------|
+| **Request counter** | `http_requests_total` `[endpoint, method]` | `http_requests_total` `[method, status, handler]` |
+| **Response / status tracking** | `http_responses_total` `[endpoint, status_code, method]` (separate counter) | Included in `http_requests_total` via `status` label |
+| **Duration** | `http_request_duration_seconds` Histogram `[endpoint, method]` | `http_request_duration_seconds` Histogram `[method, handler]` |
+| **In-flight requests** | `http_requests_active` Gauge `[endpoint, method]` | `http_requests_in_progress` Gauge |
+| **Request/response size** | Not tracked | `http_request_size_bytes`, `http_response_size_bytes` (Summary) |
+| **Excluded endpoints** | None (all paths tracked) | `/metrics`, `/health`, `/load`, `/ping`, `/version`, `/server_info` |
+
+### Status Code Breakdown (2xx/4xx/5xx)
+
+Both frameworks provide HTTP status code breakdown:
+- **SGLang**: Via `http_responses_total` with `status_code` label (e.g., `"200"`, `"400"`, `"500"`)
+- **vLLM**: Via `http_requests_total` with `status` label (provided by `prometheus_fastapi_instrumentator`)
+
+### SGLang HTTP Duration Buckets
+
+`[0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0, 30.0, 60.0, 120.0]`
+
+vLLM uses the `prometheus_fastapi_instrumentator` default buckets.
+
+### SGLang-Only: Routing Key Tracking
+
+SGLang also tracks `routing_keys_active` (Gauge) — the number of unique routing keys with active requests, used for multi-tenant load balancing via the `x-smg-routing-key` header.
 
 ---
 
@@ -669,7 +693,7 @@ Some SGLang metrics are **only recorded when using streaming requests** (`stream
 | **P1** | Grammar/SO metrics (11 metrics) | Grammar compilation, cache hits, timeouts | Structured output monitoring |
 | **P1** | PD disaggregation metrics (12 metrics) | Prefill/decode queue depths, KV transfer | Disaggregated serving monitoring |
 | **P2** | `gpu_execution_seconds_total` | GPU execution time tracking | GPU utilization analysis |
-| **P2** | Retraction detail (input/output tokens) | More granular preemption tracking | Memory pressure debugging |
+| **P2** | Retraction token counters (input/output) | `num_retracted_input_tokens_total`, `num_retracted_output_tokens_total` | Memory pressure debugging |
 | **P2** | GPU cache eviction metrics | Eviction/load-back duration and counts | Tiered cache performance |
 | **P3** | Routing key metrics | Per-routing-key request distribution | Multi-tenant analysis |
 | **P3** | CUDA graph metrics | Forward pass counts by graph mode | Performance mode analysis |
@@ -681,8 +705,8 @@ Some SGLang metrics are **only recorded when using streaming requests** (`stream
 
 #### Counter Naming Alignment
 The `_total` suffix difference is cosmetic but causes confusion in unified dashboards:
-- SGLang: `prompt_tokens_total`, `generation_tokens_total`, `num_preemptions_total`, `request_success_total`
-- vLLM: `prompt_tokens`, `generation_tokens`, `num_preemptions`, `request_success`
+- SGLang: `prompt_tokens_total`, `generation_tokens_total`, `num_retracted_requests_total`, `request_success_total`
+- vLLM: `prompt_tokens_total`, `generation_tokens_total`, `num_retracted_requests_total`, `request_success_total`
 
 **Recommendation**: Align on the `_total` suffix (OpenMetrics standard for counters).
 
@@ -709,8 +733,8 @@ For consistent P50/P99 calculations across frameworks, align bucket boundaries f
 | `python/sglang/srt/metrics/collector.py` | Metrics definitions (SchedulerMetricsCollector, TokenizerMetricsCollector, etc.) |
 | `python/sglang/srt/managers/tokenizer_manager.py` | Recording logic for request-level metrics |
 | `python/sglang/srt/managers/scheduler_metrics_mixin.py` | Scheduler-level metrics recording |
-| `python/sglang/srt/openai_api/common.py` | HTTP-level metrics, request type counters |
-| `python/sglang/srt/openai_api/v1/serving_chat.py` | Chat serving handler (request type detection) |
+| `python/sglang/srt/utils/common.py` | HTTP-level metrics middleware |
+| `python/sglang/srt/entrypoints/openai/serving_chat.py` | Chat serving handler (request type counters) |
 | `docs/references/production_metrics.md` | Official documentation |
 
 ### vLLM
@@ -720,5 +744,6 @@ For consistent P50/P99 calculations across frameworks, align bucket boundaries f
 | `vllm/v1/metrics/stats.py` | Stats data structures |
 | `vllm/v1/metrics/prometheus.py` | Prometheus setup |
 | `vllm/v1/spec_decode/metrics.py` | Speculative decoding metrics |
-| `vllm/entrypoints/openai/serving_chat.py` | Chat serving handler (request type detection) |
+| `vllm/entrypoints/openai/chat_completion/serving.py` | Chat serving handler (request type counters) |
+| `vllm/entrypoints/serve/instrumentator/metrics.py` | HTTP-level metrics (`prometheus_fastapi_instrumentator`) |
 | `vllm/config/*.py` | Config info metric labels |
