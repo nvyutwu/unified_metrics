@@ -6,29 +6,37 @@
 
 ---
 
-## Recent Fix
+## Summary of Fixes
 
-### Missing headers in Chat Completions API request logging
+Two categories of issues were introduced during the rebase from the old branch
+(`feat/production-otel-logging`) onto `v0.16.0`. Both are now fully resolved.
 
-**Commit:** `c57d6ae6b` on `feat/unified-metrics-0.16.0`
+### 1. `nca_id` header logging
 
-During the rebase from the old branch (`feat/production-otel-logging`) onto `v0.16.0`, the
-`chat_completion/serving.py` file lost the HTTP request headers collection in the
-`openai.request` payload log. The old branch had this in `serving_chat.py`, but when v0.16.0
-refactored into `chat_completion/serving.py`, the cherry-picked code did not include headers.
+The `nca_id` field (from HTTP request headers) is needed for request tracing.
 
-**What was fixed:**
-- Added `headers_obj = {k: v for k, v in raw_request.headers.items()}` collection
-- Added `"headers": headers_obj` to the `extra` dict in `payload_logger.info("openai.request")`
-- Changed `rid` from `getattr(request, "request_id", "")` to `self._base_request_id(raw_request, ...)` to match the old branch pattern
+| API | Old branch | Rebased branch (before fix) | After fix |
+|-----|-----------|---------------------------|-----------|
+| Chat Completions | **Yes** | **Lost** (rebase dropped headers collection) | **Yes** (`c57d6ae6b`) |
+| Completions | **No** | **Yes** (new work added during rebase) | **Yes** |
+| Responses | **No** | **Yes** (new work added during rebase) | **Yes** |
 
-**Also fixed in the same commit:**
-- `completion/serving.py` and `responses/serving.py` had headers and payloads serialized as
-  JSON strings (`json.dumps`). Changed to pass dicts directly for proper OTEL structured logging,
-  matching the chat_completion pattern and the old branch's comment:
-  "Pass dict directly for proper OTEL structured logging"
-- Removed duplicate `"otel"` key in `setup.py` (upstream v0.16.0 had a subset that would
-  override our version with `kratos-cli`)
+**Fix commit:** `c57d6ae6b` — restored headers collection in chat completions, also fixed
+`rid` to use `self._base_request_id(raw_request, ...)` and changed all APIs from
+`json.dumps` to passing dicts directly for proper OTEL structured logging.
+
+### 2. Response payload logging (structured content)
+
+The `payload_logger` logs structured `openai.response` records to OTEL with the full
+response content (choices, output items, usage).
+
+| API | Old branch | Rebased branch (before fix) | After fix |
+|-----|-----------|---------------------------|-----------|
+| Chat Completions | **Full** (choices with reasoning, content, tool_calls) | **Full** (no change needed) | **Full** |
+| Completions | **None** | **Empty** (choices: [], usage only) | **Full** — choices with text + finish_reason (`2ed0d6a0b`) |
+| Responses | **None** | **Empty** (output_count only, no streaming) | **Full** — structured output items for both streaming and non-streaming (`2ed0d6a0b`) |
+
+**Fix commit:** `2ed0d6a0b` — populated completions choices and responses output items
 
 ---
 
@@ -88,11 +96,11 @@ The old branch only had `payload_logger` in `serving_chat.py`. The completions A
 The completions/responses request payload logging on the rebased branch was **new work**
 added during the rebase, not carried over from the old branch.
 
-| API | Old branch `payload_logger` | Rebased branch `payload_logger` |
-|-----|----------------------------|--------------------------------|
-| Chat Completions | Request + Response (full) | Request + Response (full) |
-| Completions | **None** | Request only + Response (empty choices) |
-| Responses | **None** | Request only + Response (metadata only) |
+| API | Old branch `payload_logger` | Rebased branch (before fix) | Rebased branch (after fix) |
+|-----|----------------------------|---------------------------|--------------------------|
+| Chat Completions | Request + Response (full) | Request (missing headers/rid) + Response (full) | Request (full) + Response (full) |
+| Completions | **None** | Request + Response (empty choices) | Request + Response (full choices) |
+| Responses | **None** | Request + Response (metadata only, no streaming) | Request + Response (full output, both modes) |
 
 ---
 
