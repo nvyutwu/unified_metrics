@@ -20,6 +20,7 @@
 12. [SGLang Streaming Requirement](#12-sglang-streaming-requirement)
 13. [Remaining Gaps & Recommendations](#13-remaining-gaps--recommendations)
 14. [Appendix: File Locations](#14-appendix-file-locations)
+15. [Bridge-Side Metric Renaming](#15-bridge-side-metric-renaming)
 
 ---
 
@@ -876,3 +877,104 @@ For consistent P50/P99 calculations across frameworks, align bucket boundaries f
 | `vllm/entrypoints/openai/responses/serving.py` | Responses serving handler |
 | `vllm/entrypoints/serve/instrumentator/metrics.py` | HTTP-level metrics (`prometheus_fastapi_instrumentator`) |
 | `vllm/config/*.py` | Config info metric labels |
+
+---
+
+## 15. Bridge-Side Metric Renaming
+
+### Problem
+
+To unify metrics naming between vLLM and SGLang, we previously renamed metrics directly in
+each framework's source code (removing `vllm:` / `sglang:` prefixes, aligning `_total`
+suffixes, etc.). This approach works but creates a maintenance burden:
+
+- Every rebase onto upstream requires resolving conflicts in metrics definition files
+- Upstream PRs that add new metrics need manual renaming
+- Two separate codebases must be kept in sync
+
+### Solution: Rename in the Prom-to-OTEL bridge
+
+Instead of modifying source code, apply metric name transformations in the **bridge thread**
+(`otel_instrumentation.py :: start_prom_to_otel_bridge`), which already scrapes Prometheus
+metrics and re-exports them as OTEL instruments. The bridge already has a
+`_sanitize_metric_name` function that transforms names — extend it with a mapping dictionary.
+
+**File:** `vllm/otel_instrumentation.py`
+
+### Approach
+
+1. Keep native metric names untouched in vLLM/SGLang source code (`vllm:prompt_tokens`,
+   `sglang:prompt_tokens_total`, etc.)
+2. Define a mapping dictionary in `otel_instrumentation.py` that maps native Prometheus
+   metric names to unified OTEL metric names
+3. Apply the mapping in `_sanitize_metric_name()` before creating OTEL instruments
+
+### Mapping dictionary
+
+The dictionary handles three kinds of transformations:
+
+1. **Prefix stripping** — `vllm_` / `sglang_` → common name
+2. **Suffix alignment** — `_total` presence/absence
+3. **Name differences** — metrics that have completely different names across frameworks
+
+```python
+# Native Prometheus name → unified OTEL name
+# Only entries that need renaming; unlisted metrics pass through with prefix stripped.
+_METRIC_NAME_MAP: dict[str, str] = {
+    # --- Token counters (suffix alignment) ---
+    # vLLM uses no _total suffix; SGLang uses _total
+    "vllm_prompt_tokens":                   "prompt_tokens_total",
+    "sglang_prompt_tokens_total":           "prompt_tokens_total",
+    "vllm_generation_tokens":               "generation_tokens_total",
+    "sglang_generation_tokens_total":       "generation_tokens_total",
+
+    # --- Request counters (suffix alignment) ---
+    "vllm_request_success":                 "request_success_total",
+    "sglang_request_success_total":         "request_success_total",
+
+    # --- Metrics with identical names after prefix strip (just strip prefix) ---
+    # e.g. vllm_e2e_request_latency_seconds → e2e_request_latency_seconds
+    #      sglang_e2e_request_latency_seconds → e2e_request_latency_seconds
+    # These are handled by the default prefix-strip logic, no explicit entry needed.
+
+    # --- Metrics with different names across frameworks ---
+    # Add entries here when the name differs beyond just prefix/suffix.
+    # Example (hypothetical):
+    # "vllm_num_requests_running":          "num_requests_running",
+    # "sglang_running_req_count":           "num_requests_running",
+}
+
+
+def _sanitize_metric_name(name: str) -> str:
+    name = name.replace(":", "_")
+    # Check explicit mapping first
+    if name in _METRIC_NAME_MAP:
+        return _METRIC_NAME_MAP[name]
+    # Default: strip known prefixes
+    for prefix in ("vllm_", "sglang_"):
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
+```
+
+### What this changes
+
+| Aspect | Before (source-code renaming) | After (bridge-side renaming) |
+|--------|-------------------------------|------------------------------|
+| vLLM source code | Modified metric names | **Untouched** — keep native `vllm:` prefix |
+| SGLang source code | Modified metric names | **Untouched** — keep native `sglang:` prefix |
+| Rebase conflicts | Frequent (metrics files change often) | **None** (no source changes) |
+| New upstream metrics | Need manual renaming | Auto-stripped prefix; add to map only if name differs |
+| Mapping maintenance | Scattered across source files | **Single dictionary** in `otel_instrumentation.py` |
+| Prometheus `/metrics` endpoint | Shows unified names | Shows **native** names (only OTEL export is unified) |
+| OTEL collector | Receives unified names | Receives unified names (same outcome) |
+
+### Considerations
+
+- **Prometheus dashboards** that scrape `/metrics` directly will see native names (`vllm_*`).
+  Only the OTEL export path gets unified names. This is acceptable if all production
+  monitoring goes through the OTEL collector.
+- The mapping dictionary should be kept in sync with this comparison doc (§2) when new
+  shared metrics are added.
+- For metrics unique to one framework (§3, §4), no mapping is needed — they pass through
+  with prefix stripped.

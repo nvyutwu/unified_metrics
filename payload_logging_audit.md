@@ -40,32 +40,91 @@ response content (choices, output items, usage).
 
 ---
 
-## Logging Architecture
+## Overall Architecture
 
-There are two logging systems for payload logging:
+There are two separate data paths: **metrics** and **logging**. Both flow to the OTEL
+collector but through different mechanisms.
 
-| System | Logger | Purpose |
-|--------|--------|---------|
-| **Payload logger** | `payload_logger = logging.getLogger("vllm.payload")` | OTEL structured logging of full request/response payloads. Controlled by `VLLM_LOG_PAYLOADS` env var (default: `"1"` = enabled). Logs structured `extra` dicts with `rid`, `endpoint`, `payload`, `headers`. |
-| **Request logger** | `RequestLogger` class (`vllm/entrypoints/logger.py`) | Pre-existing vLLM logging infrastructure. `log_inputs()` logs params at INFO, prompt at DEBUG. `log_outputs()` logs generated text at INFO. Controlled by `--enable-log-outputs` / `--disable-log-requests` flags. |
+### Metrics path (Prometheus → OTEL)
 
-### OTEL pipeline
+vLLM natively exposes Prometheus metrics at `/metrics`. We added a bridge thread that
+periodically scrapes these and re-exports them as OTEL instruments via gRPC/OTLP.
 
 ```
-payload_logger  ──┐
-                   ├──→ root "vllm" logger ──→ OTEL handler ──→ OTEL collector ──→ Kratos
-request_logger  ──┘          │
-                             └──→ Console handler (filtered)
+vLLM Prometheus metrics (/metrics endpoint)
+    │
+    ▼
+Prom-to-OTEL bridge thread (scrapes every 30s, configurable)
+    │  converts counters/gauges/histograms to OTEL instruments
+    ▼
+OTEL MeterProvider → OTLP MetricExporter (gRPC)
+    │
+    ▼
+OTEL Collector (OTEL_EXPORTER_OTLP_METRICS_ENDPOINT)
 ```
 
-Both loggers are children of the root `vllm` logger. The OTEL log handler is attached at the
-root level, so **all log records flow to OTEL** unless explicitly filtered by `OtelLogFilter`.
+### Logging path (Python logging → OTEL)
+
+All logging flows through the root `vllm` logger, which has two handlers: console and OTEL.
+The OTEL handler uses a queue to avoid blocking the main serving thread.
+
+```
+Main serving thread
+    │
+    ├─ payload_logger.info("openai.request", extra={...})
+    │  payload_logger.info("openai.response", extra={...})
+    │
+    └─ request_logger.log_inputs(...) / request_logger.log_outputs(...)
+           │
+           ▼
+    root "vllm" logger
+           │
+    ┌──────┴──────────────┐
+    ▼                     ▼
+Console handler        QueueHandler
+(+ ConsoleLogFilter)       │
+    │                 queue.put(record)  ← returns immediately, non-blocking
+    ▼                     │
+stdout/stderr             ▼
+                    [queue.Queue]  ← Python stdlib thread-safe queue data structure
+                          │
+                          ▼  QueueListener daemon thread (separate from serving)
+                          │  queue.get(record)  ← blocks here waiting for records
+                          │
+                     OtelLogFilter (drops high-volume engine stats)
+                          │
+                     KratosOffloadFilter (optional)
+                          │  if record has base64 data URIs > 256KB:
+                          │    → bulk_upload to Kratos S3 (synchronous, but on this thread)
+                          │    → replace inline data with [offloaded:s3://...] reference
+                          │
+                     OTEL LoggingHandler → OTLP LogExporter (gRPC)
+                          │
+                          ▼
+                    OTEL Collector (OTEL_EXPORTER_OTLP_LOGS_ENDPOINT)
+```
+
+**How the queue works:** The `QueueHandler` (Python stdlib `logging.handlers.QueueHandler`)
+has an `emit()` that just does `queue.put(record)` — no I/O, returns immediately. The
+`QueueListener` (also stdlib) spawns a **daemon thread** that loops calling `queue.get()`,
+then passes each record through the filters and handler chain. This means the Kratos
+`bulk_upload` (which does a synchronous HTTP call to S3) happens on the QueueListener thread,
+not on the main serving thread. The queue is what provides the non-blocking behavior.
+
+### What goes where
+
+| Data | Path | Destination |
+|------|------|-------------|
+| Prometheus metrics (latency, throughput, etc.) | Prom bridge → OTLP MetricExporter | OTEL Collector |
+| `openai.request` / `openai.response` payloads | `payload_logger` → QueueHandler → OTLP LogExporter | OTEL Collector |
+| `request_logger` outputs ("Generated response...") | Same path (child of `vllm` root logger) | OTEL Collector |
+| Large binary blobs (base64 images in payloads) | KratosOffloadFilter → `kratos.bulksync.bulk_upload` | Kratos S3 bucket |
 
 ### Console vs OTEL filtering
 
 | Filter | Applied to | Blocks |
 |--------|------------|--------|
-| `ConsoleLogFilter` | Console handlers | `openai.request`, `openai.response`, `Generated response.*chatcmpl-` |
+| `ConsoleLogFilter` | Console handlers | `openai.request`, `openai.response`, `Generated response.*chatcmpl-\|cmpl-\|resp_` |
 | `OtelLogFilter` | OTEL handler | `Avg prompt throughput`, `vllm.v1.metrics` |
 
 **Key insight:** `request_logger` messages are blocked from console but **NOT blocked from
@@ -73,17 +132,20 @@ OTEL**. This means `"Received request"` and `"Generated response"` log lines flo
 to the OTEL collector as unstructured text alongside the structured `payload_logger` records.
 This is true on both the old branch (`feat/production-otel-logging`) and the rebased branch.
 
-### Overlap between the two loggers
+### payload_logger vs request_logger
 
-**Request INPUT:**
-- `payload_logger`: Full request payload dict + HTTP headers (structured)
-- `request_logger.log_inputs()`: Params + LoRA request at INFO, prompt + token IDs at DEBUG
-- Overlap: Minimal (prompt text appears in both, but at different log levels)
+Both are Python loggers that are children of the root `vllm` logger — both flow to the
+same OTEL handler and collector. The difference is what they log and why they exist.
 
-**Response OUTPUT:**
-- `payload_logger`: Structured `resp_summary` dict with choices, usage (one record)
-- `request_logger.log_outputs()`: Individual content parts as plain text log lines
-- Overlap: **Significant** — generated text appears in both, but with different granularity
+| | `payload_logger` | `request_logger` |
+|---|---|---|
+| **Definition** | `logging.getLogger("vllm.payload")` | `RequestLogger` class (`vllm/entrypoints/logger.py`) |
+| **Origin** | Our custom addition for OTEL | Pre-existing vLLM infrastructure |
+| **Format** | Structured dicts in `extra` (`rid`, `endpoint`, `payload`, `headers`) | Plain text log lines (`"Received request %s: params: %s"`, `"Generated response %s"`) |
+| **Request logging** | Full request payload dict + HTTP headers as one structured record | Params at INFO, prompt + token IDs at DEBUG |
+| **Response logging** | Full `resp_summary` dict with choices/output, usage as one structured record | Individual content parts as separate plain text lines |
+| **Control** | `VLLM_LOG_PAYLOADS` env var (default: `"1"` = enabled) | `--disable-log-requests` / `--enable-log-outputs` CLI flags |
+| **Overlap** | Minimal on request side; **significant on response side** — same generated text appears in both with different granularity |
 
 ---
 
