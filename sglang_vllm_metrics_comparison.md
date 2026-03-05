@@ -42,17 +42,47 @@
 
 These metrics exist in both frameworks on the `feat/unified-metrics` branches with compatible names and semantics.
 
+### Request Lifecycle & Timestamps
+
+Both engines track the same request lifecycle stages, though they use different variable names and clock types:
+
+```
+arrival / received        ← HTTP request hits the API server
+    │                        vLLM: arrival_time (time.time())
+    │                        SGLang: received_time / created_time (time.time())
+    ▼  [tokenization, input preprocessing, IPC to engine core]
+queued                    ← request enters scheduler's waiting queue
+    │                        vLLM: queued_ts (time.monotonic())
+    │                        SGLang: wait_queue_entry_time (time.perf_counter())
+    ▼  [waiting for KV cache / compute budget]
+scheduled                 ← scheduler picks request into a running batch
+    │                        vLLM: scheduled_ts (time.monotonic())
+    │                        SGLang: forward_entry_time (time.perf_counter())
+    ▼  [GPU forward pass - prefill]
+first_token               ← first output token produced
+    │                        vLLM: first_token_ts (time.monotonic())
+    │                        SGLang: first_token_time (time.time())
+    ▼  [decode iterations]
+last_token / finished     ← final output token produced
+                             vLLM: last_token_ts (time.monotonic()) / iteration_timestamp (time.time())
+                             SGLang: finished_time (time.time())
+```
+
+**Clock differences:** vLLM uses `time.monotonic()` for engine-core timestamps (queued → last_token) and `time.time()` for frontend timestamps (arrival, iteration). SGLang uses `time.perf_counter()` for scheduler timestamps and `time.time()` for API-level timestamps. Timestamps on different clocks cannot be subtracted from each other, so each metric uses a consistent clock pair.
+
+**Key distinction:** `arrival_time` ≠ `queued_ts`. The gap between them includes tokenization, input preprocessing, and IPC transfer from frontend to engine core. The `e2e_request_latency` uses arrival/finished (wall-clock), while `request_queue_time` uses queued/scheduled (monotonic).
+
 ### Core Latency Histograms
 
 | Metric Name | SGLang | vLLM | Computation Match? |
 |-------------|--------|------|-------------------|
-| `e2e_request_latency_seconds` | Histogram | Histogram | **YES** (finished - created vs iteration_ts - arrival) |
-| `time_to_first_token_seconds` | Histogram | Histogram | **YES** (first_token - created vs iteration_ts - arrival) |
+| `e2e_request_latency_seconds` | Histogram | Histogram | **YES** — both measure wall-clock from request arrival to completion. SGLang: `finished_time - created_time`. vLLM: `iteration_ts - arrival_time`. |
+| `time_to_first_token_seconds` | Histogram | Histogram | **YES** — SGLang: `first_token_time - created_time`. vLLM: `iteration_ts - arrival_time` (on first token iteration). Both use wall-clock, both include queue wait. |
 | `inter_token_latency_seconds` | Histogram | Histogram | **SIMILAR** (SGLang normalizes by num_new_tokens; vLLM measures individual gaps) |
-| `request_queue_time_seconds` | Histogram | Histogram | **YES** (both: scheduled - queued) |
-| `request_inference_time_seconds` | Histogram | Histogram | **YES** (both: last_token - scheduled) |
-| `request_prefill_time_seconds` | Histogram | Histogram | **YES** (both: first_token - scheduled) |
-| `request_decode_time_seconds` | Histogram | Histogram | **YES** (both: last_token - first_token) |
+| `request_queue_time_seconds` | Histogram | Histogram | **YES** — both: `scheduled - queued` (monotonic clocks). SGLang: `forward_entry_time - wait_queue_entry_time`. vLLM: `scheduled_ts - queued_ts`. |
+| `request_inference_time_seconds` | Histogram | Histogram | **YES** — both: `last_token - scheduled` (monotonic). Excludes queue wait. |
+| `request_prefill_time_seconds` | Histogram | Histogram | **YES** — both: `first_token - scheduled` (monotonic). |
+| `request_decode_time_seconds` | Histogram | Histogram | **YES** — both: `last_token - first_token` (monotonic). |
 | `request_time_per_output_token_seconds` | Histogram | Histogram | **YES** (both: decode_time / (gen_tokens - 1)) |
 
 ### Token Counters

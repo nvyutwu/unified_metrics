@@ -1,15 +1,15 @@
-# Payload Logging Audit - vLLM feat/unified-metrics-0.16.0
+# Payload Logging Audit - vLLM & SGLang Unified Metrics Branches
 
-**Date:** 2025-02-25
-**Branch:** `feat/unified-metrics-0.16.0` (rebased on `v0.16.0`)
+**Date:** 2025-02-26 (updated)
+**vLLM Branch:** `feat/unified-metrics-0.16.0` (rebased on `v0.16.0`)
+**SGLang Branch:** `feat/unified-metrics-rebased-02122026`
 **Base commit (OTEL logging):** `2d2396eb0fa70e51c3e22352e3e4453276657dc7`
 
 ---
 
 ## Summary of Fixes
 
-Two categories of issues were introduced during the rebase from the old branch
-(`feat/production-otel-logging`) onto `v0.16.0`. Both are now fully resolved.
+Three categories of issues have been identified and resolved across both codebases.
 
 ### 1. `nca_id` header logging
 
@@ -37,6 +37,14 @@ response content (choices, output items, usage).
 | Responses | **None** | **Empty** (output_count only, no streaming) | **Full** — structured output items for both streaming and non-streaming (`2ed0d6a0b`) |
 
 **Fix commit:** `2ed0d6a0b` — populated completions choices and responses output items
+
+### 3. OTEL log noise from `request_logger` overlap
+
+`request_logger` messages (`"Received request"`, `"Generated response"`) were leaking to
+the OTEL pipeline as unstructured text, duplicating the structured `payload_logger` records.
+
+**Fix commit:** `cbd070bd3` — added `"Received request"` and `"Generated response"` patterns
+to `OtelLogFilter`'s blocklist. These messages now only appear on console for debugging.
 
 ---
 
@@ -117,7 +125,7 @@ not on the main serving thread. The queue is what provides the non-blocking beha
 |------|------|-------------|
 | Prometheus metrics (latency, throughput, etc.) | Prom bridge → OTLP MetricExporter | OTEL Collector |
 | `openai.request` / `openai.response` payloads | `payload_logger` → QueueHandler → OTLP LogExporter | OTEL Collector |
-| `request_logger` outputs ("Generated response...") | Same path (child of `vllm` root logger) | OTEL Collector |
+| `request_logger` outputs ("Generated response...") | Blocked by `OtelLogFilter` (`cbd070bd3`) | Console only |
 | Large binary blobs (base64 images in payloads) | KratosOffloadFilter → `kratos.bulksync.bulk_upload` | Kratos S3 bucket |
 
 ### Console vs OTEL filtering
@@ -125,12 +133,12 @@ not on the main serving thread. The queue is what provides the non-blocking beha
 | Filter | Applied to | Blocks |
 |--------|------------|--------|
 | `ConsoleLogFilter` | Console handlers | `openai.request`, `openai.response`, `Generated response.*chatcmpl-\|cmpl-\|resp_` |
-| `OtelLogFilter` | OTEL handler | `Avg prompt throughput`, `vllm.v1.metrics` |
+| `OtelLogFilter` | OTEL handler | `Avg prompt throughput`, `vllm.v1.metrics`, `Received request`, `Generated response` |
 
-**Key insight:** `request_logger` messages are blocked from console but **NOT blocked from
-OTEL**. This means `"Received request"` and `"Generated response"` log lines flow through
-to the OTEL collector as unstructured text alongside the structured `payload_logger` records.
-This is true on both the old branch (`feat/production-otel-logging`) and the rebased branch.
+**Clean separation (after `cbd070bd3`):** `request_logger` messages are now blocked from
+**both** console (via `ConsoleLogFilter`) and OTEL (via `OtelLogFilter`). Only the structured
+`payload_logger` records (`openai.request` / `openai.response`) flow to the OTEL collector.
+This eliminates the duplicate/overlapping data that existed on the old branch.
 
 ### payload_logger vs request_logger
 
@@ -145,7 +153,7 @@ same OTEL handler and collector. The difference is what they log and why they ex
 | **Request logging** | Full request payload dict + HTTP headers as one structured record | Params at INFO, prompt + token IDs at DEBUG |
 | **Response logging** | Full `resp_summary` dict with choices/output, usage as one structured record | Individual content parts as separate plain text lines |
 | **Control** | `VLLM_LOG_PAYLOADS` env var (default: `"1"` = enabled) | `--disable-log-requests` / `--enable-log-outputs` CLI flags |
-| **Overlap** | Minimal on request side; **significant on response side** — same generated text appears in both with different granularity |
+| **Overlap** | ~~Minimal on request side; significant on response side~~ **Resolved** (`cbd070bd3`): `request_logger` messages now filtered from OTEL. Only `payload_logger` flows to OTEL. |
 
 ---
 
@@ -408,20 +416,105 @@ reasoning, message, and function_call types built from the `output` list using t
 
 ---
 
-### GAP-6: `request_logger` messages leak to OTEL as unstructured log noise
+### ~~GAP-6: `request_logger` messages leak to OTEL as unstructured log noise~~ (RESOLVED)
 
-**Severity:** Medium
+**Status:** Resolved
 **Files:** `api_server.py` (`OtelLogFilter`)
 
 `request_logger` messages (`"Received request %s: params: %s"`, `"Generated response %s: output: %r"`)
-are not blocked by `OtelLogFilter`, so they flow to the OTEL collector as plain text log lines
-alongside the structured `payload_logger` records. This creates duplicate/overlapping data in the
-OTEL pipeline — the same response content appears once as a structured `openai.response` record
-(from `payload_logger`) and again as an unstructured `"Generated response..."` text line
-(from `request_logger`).
+were not blocked by `OtelLogFilter`, so they flowed to the OTEL collector as plain text log lines
+alongside the structured `payload_logger` records. This created duplicate/overlapping data in the
+OTEL pipeline.
 
-This is present on both the old branch (`feat/production-otel-logging`) and the rebased branch.
+**Fix commit:** `cbd070bd3` — added `"Received request"` and `"Generated response"` patterns to
+`OtelLogFilter`'s blocklist. These messages now only appear on console (for debugging) and no
+longer pollute the OTEL pipeline.
 
-**Fix:** Add `request_logger` patterns (`"Received request"`, `"Generated response"`) to
-`OtelLogFilter`'s blocklist so they only appear on console (for debugging) and do not pollute
-the OTEL pipeline.
+---
+
+## 5. SGLang Payload Logging
+
+**Branch:** `feat/unified-metrics-rebased-02122026`
+**Logger:** `logging.getLogger("sglang.payload")`
+**Env var:** `SGLANG_LOG_PAYLOADS=1` (default: `"0"` = disabled)
+
+### Architecture
+
+SGLang uses a shared base class (`OpenAIServingBase.handle_request()`) that handles
+payload logging for both request and non-streaming response. Chat and Completions APIs
+route through this base handler. The Responses API has its own `create_responses()` method
+that bypasses the base handler.
+
+Streaming response logging is handled per-API since the base class skips `StreamingResponse`
+objects.
+
+### Current State Per API
+
+#### Chat Completions API
+
+**Request logging:** Via `serving_base.py` `handle_request()` — logs `openai.request` with
+`rid`, `endpoint`, `payload` (full request dict), `headers` (all HTTP headers).
+
+**Response logging:**
+
+| Mode | Logged? | Content |
+|------|---------|---------|
+| Streaming | Yes | Hand-built `choices` with separate `reasoning_content`, `content`, `tool_calls` per choice, `finish_reason`, `usage` |
+| Non-streaming | Yes | Via `result.model_dump()` in base class — full pydantic serialization including all fields |
+
+- Streaming logging in `serving_chat.py` reconstructs tool_calls from parser state
+  (`detector.prev_tool_call_arr`) with proper call IDs
+- Multiple choices supported (iterates all indices from `finish_reasons`)
+
+#### Completions API
+
+**Request logging:** Via `serving_base.py` `handle_request()` — same as chat.
+
+**Response logging:**
+
+| Mode | Logged? | Content |
+|------|---------|---------|
+| Streaming | Yes | `choices` with `text` and `finish_reason` per index, plus `usage` (`91bdd7c08`) |
+| Non-streaming | Yes | Via `result.model_dump()` in base class |
+
+**Fix commit:** `91bdd7c08` — added streaming response payload logging. Previously the
+`StreamingResponse` bypassed the base class logging entirely, leaving no response record.
+Now tracks `finish_reasons` and `response_id` during streaming and logs after completion.
+
+#### Responses API
+
+**Request logging:** Own logging in `create_responses()` — logs `responses.request` with
+`rid`, `endpoint`, `payload`, `headers` (all HTTP headers).
+
+**Fix commit:** `6a70cbda6` — added missing `headers` capture to Responses API request
+logging, matching the pattern used by chat and completions via the base class.
+
+**Response logging:**
+
+| Mode | Logged? | Content |
+|------|---------|---------|
+| Non-streaming | Yes | Via `response.model_dump()` — full pydantic serialization |
+| Background | Yes | Via `response.model_dump()` or `ORJSONResponse` body |
+| Streaming | Yes | Via `final_response.model_dump()` after stream completion |
+
+All three modes use `model_dump()` which includes the full response structure with
+output items (reasoning, message, function_call types) from the pydantic model.
+
+### SGLang vs vLLM Response Payload Comparison
+
+| Feature | vLLM | SGLang |
+|---------|------|--------|
+| **Chat streaming** | Hand-built choices with separated reasoning/content/tool_calls | Hand-built choices with separated reasoning/content/tool_calls |
+| **Chat non-streaming** | Hand-built choices with separated fields | Generic `model_dump()` (fields present via pydantic) |
+| **Completions streaming** | Hand-built choices with text/finish_reason | Hand-built choices with text/finish_reason (`91bdd7c08`) |
+| **Completions non-streaming** | Hand-built choices with text/finish_reason | Generic `model_dump()` (fields present via pydantic) |
+| **Responses streaming** | Hand-built output items (reasoning/message/function_call) | `model_dump()` of final response |
+| **Responses non-streaming** | Hand-built output items | `model_dump()` of final response |
+| **Request headers** | All APIs | All APIs (Responses fixed in `6a70cbda6`) |
+| **OTEL log noise filtering** | `OtelLogFilter` blocks request_logger (`cbd070bd3`) | No `request_logger` equivalent — not applicable |
+
+### SGLang Remaining Gaps
+
+**None critical.** The non-streaming paths use generic `model_dump()` instead of hand-built
+summaries. The data is complete (all fields present via pydantic serialization) but includes
+extra pydantic boilerplate fields. This is a style difference, not a functional gap.
