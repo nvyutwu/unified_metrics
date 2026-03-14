@@ -4,10 +4,41 @@
 
 ---
 
+## What Changed (March 2026)
+
+**Before**: TRT-LLM's Prometheus endpoint (`/prometheus/metrics`) had only **7 metrics** (1 counter, 4 histograms, 2 gauges). The ~40 iteration-level fields (queue load, memory, KV cache blocks, inflight batching, spec decoding) were only available as **JSON** via the `/metrics` endpoint — invisible to Prometheus/OTel scrapers and Dynamo's OTel bridge.
+
+**After**: Two PRs added **33 new Prometheus metrics** (28 iteration-level gauges/counter + 4 config info gauges + 1 completed requests counter), bringing the total to **40 Prometheus metrics**. The key JSON iteration stats fields are now **dual-exposed**: still available as JSON at `/metrics` and also as Prometheus gauges at `/prometheus/metrics`.
+
+| Change | Before | After |
+|--------|--------|-------|
+| Prometheus metric count | 7 | 40 |
+| `num_requests_running` / `waiting` | JSON only | JSON + Prometheus |
+| Memory usage (GPU/CPU/pinned) | JSON only | JSON + Prometheus |
+| KV cache blocks (max/free/used) | JSON only | JSON + Prometheus |
+| Inflight batching stats | JSON only | JSON + Prometheus |
+| Spec decoding stats | JSON only | JSON + Prometheus |
+| Iteration latency | JSON only (ms) | JSON (ms) + Prometheus (seconds) |
+| Batch size limits | JSON only | JSON + Prometheus |
+| Config info (model, TP/PP, spec, cache) | Not exposed | Prometheus (info gauges) |
+| Dynamo OTel visibility | Only 7 metrics scraped | All 40 metrics scraped, prefix stripped to match vLLM/SGLang names |
+
+**JSON fields NOT yet in Prometheus** (remain JSON-only):
+- `timestamp`, `iter`, `newActiveRequestsQueueLatencyMS`, `numNewActiveRequests`
+- `maxBatchSizeTunerRecommended`, `maxNumTokensStatic`, `maxNumTokensTunerRecommended`
+- `kvCacheStats`: `allocTotalBlocks`, `allocNewBlocks`, `reusedBlocks`, `missedBlocks`
+- `inflightBatchingStats`: `microBatchId`
+- `specDecodingStats`: `numRequestsWithDraftTokens`, `iterLatencyMS`
+- `staticBatchingStats` (entire section)
+- All per-request `/perf_metrics` fields
+
+---
+
 ## Table of Contents
 1. [Prometheus Metrics (trtllm-serve)](#1-prometheus-metrics-trtllm-serve)
    - [Request Metrics](#request-metrics)
    - [KV Cache Metrics](#kv-cache-metrics)
+   - [Iteration-Level Metrics](#iteration-level-metrics)
 2. [Disaggregated Serving Metrics](#2-disaggregated-serving-metrics)
    - [Client-Side Metrics (per-role)](#client-side-metrics-per-role)
    - [Server-Side Metrics](#server-side-metrics)
@@ -128,12 +159,19 @@ Present only when using inflight batching scheduler.
 
 Present only when speculative decoding is enabled.
 
+#### Counters — Speculative Decoding
+
 | # | Metric Name | JSON Field | Description |
 |---|-------------|------------|-------------|
-| 1 | `trtllm_spec_decode_num_draft_tokens` | `specDecodingStats.numDraftTokens` | Draft tokens proposed |
-| 2 | `trtllm_spec_decode_num_accepted_tokens` | `specDecodingStats.numAcceptedTokens` | Draft tokens accepted |
-| 3 | `trtllm_spec_decode_acceptance_length` | `specDecodingStats.acceptanceLength` | Avg acceptance length |
-| 4 | `trtllm_spec_decode_draft_overhead` | `specDecodingStats.draftOverhead` | Draft overhead ratio |
+| 1 | `trtllm_spec_decode_num_draft_tokens_total` | `specDecodingStats.numDraftTokens` | Total draft tokens proposed (cumulative counter) |
+| 2 | `trtllm_spec_decode_num_accepted_tokens_total` | `specDecodingStats.numAcceptedTokens` | Total draft tokens accepted (cumulative counter) |
+
+#### Gauges — Speculative Decoding
+
+| # | Metric Name | JSON Field | Description |
+|---|-------------|------------|-------------|
+| 1 | `trtllm_spec_decode_acceptance_length` | `specDecodingStats.acceptanceLength` | Avg acceptance length |
+| 2 | `trtllm_spec_decode_draft_overhead` | `specDecodingStats.draftOverhead` | Draft overhead ratio |
 
 #### Gauges — Config Info (logged once at startup)
 
@@ -209,58 +247,60 @@ Each metric is prefixed by role: `ctx_` (context server), `gen_` (generation ser
 **Endpoint**: `/metrics` (returns JSON array)
 **Condition**: Requires `enable_iter_perf_stats: true` in LLM args
 
+> **Note**: Fields marked with ✅ are now **also exposed as Prometheus gauges/counters** at `/prometheus/metrics` (see Section 1). Fields without a marker remain JSON-only.
+
 ### Top-Level Iteration Stats
 
-| # | Field Name | Type | Description |
-|---|------------|------|-------------|
-| 1 | `timestamp` | string/int | Iteration ending timestamp (microseconds) |
-| 2 | `iter` | int | Iteration counter |
-| 3 | `iterLatencyMS` | float | Iteration latency (milliseconds) |
-| 4 | `newActiveRequestsQueueLatencyMS` | float | Total queue time for newly active requests (ms) |
-| 5 | `numNewActiveRequests` | int | Number of newly fetched active requests |
-| 6 | `numActiveRequests` | int | Number of currently active requests |
-| 7 | `numQueuedRequests` | int | Number of queued requests |
-| 8 | `numCompletedRequests` | int | Number of requests completed this iteration |
-| 9 | `maxNumActiveRequests` | int | Maximum active request capacity |
-| 10 | `maxBatchSizeStatic` | int | Static max batch size passed to executor |
-| 11 | `maxBatchSizeTunerRecommended` | int | Dynamic tuner recommended batch size |
-| 12 | `maxBatchSizeRuntime` | int | Runtime max batch size (min of static + upper bound) |
-| 13 | `maxNumTokensStatic` | int | Static max num tokens |
-| 14 | `maxNumTokensTunerRecommended` | int | Tuner recommended max num tokens |
-| 15 | `maxNumTokensRuntime` | int | Runtime max num tokens |
-| 16 | `gpuMemUsage` | int | GPU memory usage (bytes) |
-| 17 | `cpuMemUsage` | int | CPU memory usage (bytes) |
-| 18 | `pinnedMemUsage` | int | Pinned memory usage (bytes) |
+| # | Field Name | Type | Prometheus? | Description |
+|---|------------|------|:-----------:|-------------|
+| 1 | `timestamp` | string/int | | Iteration ending timestamp (microseconds) |
+| 2 | `iter` | int | | Iteration counter |
+| 3 | `iterLatencyMS` | float | ✅ | Iteration latency (milliseconds). Prometheus: exposed as seconds |
+| 4 | `newActiveRequestsQueueLatencyMS` | float | | Total queue time for newly active requests (ms) |
+| 5 | `numNewActiveRequests` | int | | Number of newly fetched active requests |
+| 6 | `numActiveRequests` | int | ✅ | Number of currently active requests |
+| 7 | `numQueuedRequests` | int | ✅ | Number of queued requests |
+| 8 | `numCompletedRequests` | int | ✅ | Number of requests completed this iteration. Prometheus: cumulative counter |
+| 9 | `maxNumActiveRequests` | int | ✅ | Maximum active request capacity |
+| 10 | `maxBatchSizeStatic` | int | ✅ | Static max batch size passed to executor |
+| 11 | `maxBatchSizeTunerRecommended` | int | | Dynamic tuner recommended batch size |
+| 12 | `maxBatchSizeRuntime` | int | ✅ | Runtime max batch size (min of static + upper bound) |
+| 13 | `maxNumTokensStatic` | int | | Static max num tokens |
+| 14 | `maxNumTokensTunerRecommended` | int | | Tuner recommended max num tokens |
+| 15 | `maxNumTokensRuntime` | int | ✅ | Runtime max num tokens |
+| 16 | `gpuMemUsage` | int | ✅ | GPU memory usage (bytes) |
+| 17 | `cpuMemUsage` | int | ✅ | CPU memory usage (bytes) |
+| 18 | `pinnedMemUsage` | int | ✅ | Pinned memory usage (bytes) |
 
 ### KV Cache Stats
 
 **Nested under**: `kvCacheStats` (also `crossKvCacheStats` for encoder-decoder models)
 
-| # | Field Name | Type | Description |
-|---|------------|------|-------------|
-| 1 | `maxNumBlocks` | int | Maximum KV cache blocks available |
-| 2 | `freeNumBlocks` | int | Free KV cache blocks |
-| 3 | `usedNumBlocks` | int | Used KV cache blocks |
-| 4 | `tokensPerBlock` | int | Tokens per KV cache block |
-| 5 | `allocTotalBlocks` | int | Total allocated blocks this iteration |
-| 6 | `allocNewBlocks` | int | Newly allocated blocks this iteration |
-| 7 | `reusedBlocks` | int | Reused blocks from prefix cache |
-| 8 | `missedBlocks` | int | Missed cache lookups |
-| 9 | `cacheHitRate` | float | Cache hit rate (0.0-1.0) |
+| # | Field Name | Type | Prometheus? | Description |
+|---|------------|------|:-----------:|-------------|
+| 1 | `maxNumBlocks` | int | ✅ | Maximum KV cache blocks available |
+| 2 | `freeNumBlocks` | int | ✅ | Free KV cache blocks |
+| 3 | `usedNumBlocks` | int | ✅ | Used KV cache blocks. Also used to compute `trtllm_kv_cache_utilization` |
+| 4 | `tokensPerBlock` | int | ✅ | Tokens per KV cache block |
+| 5 | `allocTotalBlocks` | int | | Total allocated blocks this iteration |
+| 6 | `allocNewBlocks` | int | | Newly allocated blocks this iteration |
+| 7 | `reusedBlocks` | int | | Reused blocks from prefix cache |
+| 8 | `missedBlocks` | int | | Missed cache lookups |
+| 9 | `cacheHitRate` | float | ✅ | Cache hit rate (0.0-1.0) |
 
 ### Inflight Batching Stats
 
 **Nested under**: `inflightBatchingStats` (only with inflight batching scheduler)
 
-| # | Field Name | Type | Description |
-|---|------------|------|-------------|
-| 1 | `numScheduledRequests` | int | Number of scheduled requests |
-| 2 | `numContextRequests` | int | Number of context (prefill) requests |
-| 3 | `numGenRequests` | int | Number of generation requests |
-| 4 | `numPausedRequests` | int | Number of paused requests |
-| 5 | `numCtxTokens` | int | Total context tokens in iteration |
-| 6 | `microBatchId` | int | Micro batch index |
-| 7 | `avgNumDecodedTokensPerIter` | float | Avg tokens decoded per request per iteration |
+| # | Field Name | Type | Prometheus? | Description |
+|---|------------|------|:-----------:|-------------|
+| 1 | `numScheduledRequests` | int | ✅ | Number of scheduled requests |
+| 2 | `numContextRequests` | int | ✅ | Number of context (prefill) requests |
+| 3 | `numGenRequests` | int | ✅ | Number of generation requests |
+| 4 | `numPausedRequests` | int | ✅ | Number of paused requests |
+| 5 | `numCtxTokens` | int | ✅ | Total context tokens in iteration |
+| 6 | `microBatchId` | int | | Micro batch index |
+| 7 | `avgNumDecodedTokensPerIter` | float | ✅ | Avg tokens decoded per request per iteration |
 
 ### Static Batching Stats
 
@@ -278,14 +318,14 @@ Each metric is prefixed by role: `ctx_` (context server), `gen_` (generation ser
 
 **Nested under**: `specDecodingStats` (only when speculative decoding is enabled)
 
-| # | Field Name | Type | Description |
-|---|------------|------|-------------|
-| 1 | `numDraftTokens` | int | Total proposed draft tokens for all requests |
-| 2 | `numAcceptedTokens` | int | Total accepted draft tokens |
-| 3 | `numRequestsWithDraftTokens` | int | Requests with at least one draft token |
-| 4 | `acceptanceLength` | float | Avg tokens produced per step per request with drafts |
-| 5 | `iterLatencyMS` | float | Draft-only iteration latency (ms) |
-| 6 | `draftOverhead` | float | Draft overhead ratio (draft latency / total latency) |
+| # | Field Name | Type | Prometheus? | Description |
+|---|------------|------|:-----------:|-------------|
+| 1 | `numDraftTokens` | int | ✅ | Total proposed draft tokens for all requests |
+| 2 | `numAcceptedTokens` | int | ✅ | Total accepted draft tokens |
+| 3 | `numRequestsWithDraftTokens` | int | | Requests with at least one draft token |
+| 4 | `acceptanceLength` | float | ✅ | Avg tokens produced per step per request with drafts |
+| 5 | `iterLatencyMS` | float | | Draft-only iteration latency (ms) |
+| 6 | `draftOverhead` | float | ✅ | Draft overhead ratio (draft latency / total latency) |
 
 ---
 
@@ -534,7 +574,11 @@ Each metric is prefixed by role: `ctx_` (context server), `gen_` (generation ser
   1. **trtllm-serve** (Python, `tensorrt_llm/serve/`): Prometheus metrics at `/prometheus/metrics` + JSON iteration stats at `/metrics` + JSON per-request perf at `/perf_metrics`
   2. **Triton backend** (C++, `triton_backend/`): Custom Triton metrics via the Triton server `/metrics` endpoint
 
-- **Prometheus metrics expanded**: The trtllm-serve Prometheus endpoint now has 36 metrics (2 counters, 4 histograms, 30 gauges), up from 7 in the initial implementation. Iteration-level stats (queue load, memory, batch sizes, KV cache blocks, inflight batching, speculative decoding) are now exposed as Prometheus gauges/counters alongside the original request-level histograms.
+- **Prometheus metrics expanded (March 2026)**: The trtllm-serve Prometheus endpoint now has **40 metrics** (2 counters, 4 histograms, 34 gauges), up from **7** in the original implementation. Two PRs added:
+  1. **Iteration stats as Prometheus gauges** (28 new metrics): Queue load (`num_requests_running/waiting`), memory usage, batch sizes, KV cache blocks, inflight batching stats, and speculative decoding stats. These JSON iteration stats fields are now **dual-exposed** — still in JSON at `/metrics`, and also as Prometheus gauges at `/prometheus/metrics`.
+  2. **Config info gauges** (4 new metrics): `model_config_info`, `parallel_config_info`, `speculative_config_info`, `cache_config_info` — logged once at startup with configuration values as labels, matching the vLLM/SGLang pattern.
+
+- **Dynamo OTel integration**: Dynamo's OTel bridge (`dynamo/common/utils/otel_instrumentation.py`) scrapes `/prometheus/metrics`, strips the `trtllm_` prefix, and adds a `backend="trtllm"` label. After these changes, Dynamo now receives metrics like `num_requests_running{backend="trtllm"}`, `gpu_memory_usage_bytes{backend="trtllm"}`, `spec_decode_acceptance_length{backend="trtllm"}`, etc. — matching vLLM/SGLang metric names after prefix stripping.
 
 - **No throughput gauge**: TRT-LLM does not expose a `gen_throughput` Prometheus gauge (both SGLang and vLLM do).
 
