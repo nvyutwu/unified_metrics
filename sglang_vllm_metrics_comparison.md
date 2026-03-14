@@ -32,7 +32,7 @@
 | Primary Metrics File | `python/sglang/srt/metrics/collector.py` | `vllm/v1/metrics/loggers.py` |
 | Stats Tracking | `tokenizer_manager.py`, `scheduler_metrics_mixin.py` | `vllm/v1/metrics/stats.py` |
 | Enable Flag | `--enable-metrics` | Enabled by default |
-| Total Metrics | ~100 | ~49 |
+| Total Metrics | ~100 | ~58 |
 | Counter Naming | Uses `_total` suffix (OpenMetrics standard) | No `_total` suffix |
 | Multiprocess Mode | Prometheus multiprocess via `PROMETHEUS_MULTIPROC_DIR` | Single-process (frontend) |
 
@@ -130,7 +130,7 @@ last_token / finished     ← final output token produced
 | Metric Name | SGLang | vLLM | Match? |
 |-------------|--------|------|--------|
 | `cache_hit_rate` (SGLang) / `prefix_cache_queries` + `prefix_cache_hits` (vLLM) | Gauge (ratio) | Two Counters | **DIFFERENT approach**: SGLang exposes pre-computed ratio; vLLM exposes raw counters for PromQL |
-| `cached_tokens_total` (SGLang) / `prefix_cache_hits` (vLLM) | Counter | Counter | **SIMILAR** |
+| `cached_tokens_total` (SGLang) / `prompt_tokens_cached` (vLLM) | Counter | Counter | **YES** — both count cached prompt tokens. vLLM aggregates local + external cached tokens |
 | `mm_cache_queries` | Counter | Counter | **YES** (multi-modal cache queries) |
 | `mm_cache_hits` | Counter | Counter | **YES** (multi-modal cache hits) |
 
@@ -359,6 +359,14 @@ The queue depth gauges cannot be added to vLLM without redesigning its disaggreg
 | `kv_block_lifetime_seconds` | Histogram | Block lifetime: allocation to eviction |
 | `kv_block_idle_before_evict_seconds` | Histogram | Idle time before eviction |
 | `kv_block_reuse_gap_seconds` | Histogram | Time between consecutive block accesses |
+
+### Prompt Token Breakdown (new in v2-0.16.0)
+
+| Metric Name | Type | Extra Labels | Description |
+|-------------|------|-------------|-------------|
+| `prompt_tokens_by_source` | Counter | `source` (local_compute, local_cache_hit, external_kv_transfer) | Number of prompt tokens broken down by source |
+| `prompt_tokens_cached` | Counter | — | Number of cached prompt tokens (local + external). Similar to SGLang's `cached_tokens_total` |
+| `prompt_tokens_recomputed` | Counter | — | Number of cached tokens recomputed for forward pass (e.g., last token recompute when entire prompt is cached) |
 
 ### Cache Counters (more granular)
 
@@ -874,8 +882,10 @@ For consistent P50/P99 calculations across frameworks, align bucket boundaries f
 
 #### Next Steps for Full Parity
 1. **SGLang**: Add `request_prefill_kv_computed_tokens` and `iteration_tokens_total`
-2. **vLLM**: Add structured output/grammar metrics if/when structured output support is added
-3. **Both**: Consider adopting `iteration_tokens_total` as a shared metric for batch utilization
+2. **SGLang**: Consider adding `prompt_tokens_by_source` breakdown (local_compute, local_cache_hit, external_kv_transfer) to match new vLLM token provenance tracking
+3. **vLLM**: Add `prompt_tokens_by_source`, `prompt_tokens_cached`, `prompt_tokens_recomputed` to `_METRIC_NAME_MAP` in the OTel bridge for proper `_total` suffix alignment
+4. **vLLM**: Add structured output/grammar metrics if/when structured output support is added
+5. **Both**: Consider adopting `iteration_tokens_total` as a shared metric for batch utilization
 
 ---
 
@@ -1008,3 +1018,7 @@ def _sanitize_metric_name(name: str) -> str:
   shared metrics are added.
 - For metrics unique to one framework (§3, §4), no mapping is needed — they pass through
   with prefix stripped.
+- **Note (v2-0.16.0)**: The new `prompt_tokens_by_source`, `prompt_tokens_cached`, and
+  `prompt_tokens_recomputed` counters are NOT yet in `_METRIC_NAME_MAP`. They will be
+  auto-stripped of the `vllm_` prefix but will NOT get `_total` suffix alignment in the
+  OTel export. Consider adding them to the map for consistency.
