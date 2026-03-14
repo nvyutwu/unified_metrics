@@ -608,6 +608,63 @@ Each metric is prefixed by role: `ctx_` (context server), `gen_` (generation ser
 | PyExecutor internal timing | Internal only | 10 fields per request | Not exposed |
 | Triton custom metrics | Triton backend | ~28 metric series | Triton `/metrics` |
 
+## 9. Dynamo OTel Bridge Review Scorecard (2026-03-14)
+
+Architecture: TRT-LLM engine → Prometheus `/metrics` → Dynamo OTel bridge (`otel_instrumentation.py`) → OTLP push → NVCF OTel Collector.
+
+**Verdict: Architecture is sound. One code change made, rest non-issues or deferred.**
+
+| # | Issue | Action | Details |
+|---|-------|--------|---------|
+| 1 | **Histogram `_total` suffix bug** | **Deferred — needs debugging** | See detailed analysis below |
+| 2 | Scrape interval 30s staleness | No change | KV-aware routing uses NATS (real-time), not OTel. 30s is fine for dashboards. |
+| 3 | Missing `gen_throughput` gauge | No change | Rust frontend already has `output_tokens_total` counter. Users compute `rate()` in PromQL. vLLM does the same (no gauge, only counter). |
+| 4 | KV transfer cross-backend normalization | No change | TRT-LLM is the only backend in Dynamo with KV transfer Prometheus metrics. No mismatch exists. |
+| 5 | Disaggregated role metrics (`ctx_*`, `gen_*`) | No change | Dynamo owns disagg orchestration; TRT-LLM's native role metrics are unused. |
+| 6 | Per-request `/perf_metrics` not captured | No change | Useful parts already extracted: KV transfer timing → `AdditionalMetricsCollector`, cached tokens → `kv_cache_metrics`. |
+| 6b | Spec decode metrics: Gauge → Counter | **Changed** | `spec_decode_num_draft_tokens` and `spec_decode_num_accepted_tokens` changed from Gauge to Counter. Enables `rate()` queries. |
+| 7 | Thread safety of global dicts | No change | CPython GIL makes dict ops atomic. Safe for current deployment. |
+| 8 | Frontend `DYN_SYSTEM_PORT` removal | No change | Correct behavior — auto-detection classifies as `dynamo.frontend`. |
+
+**Key constraint**: NVCF owns the OTel Collector config — all fixes must be in-process (Dynamo or TRT-LLM side).
+
+### Bug: Histogram `_total` suffix in OTel export
+
+**Status**: Open — needs debugging to confirm root cause location.
+
+**Symptom**: Prometheus histogram metrics (e.g., `trtllm_e2e_request_latency_seconds`) appear in the OTel/downstream system with spurious `_total` suffixes on their sub-metrics (e.g., `e2e_request_latency_seconds_count_total`, `e2e_request_latency_seconds_bucket_total`).
+
+**Root cause chain**:
+
+1. Prometheus exposes histograms as three sample types: `_bucket`, `_count`, `_sum`
+2. The Dynamo OTel bridge (`otel_instrumentation.py`, lines 434-445) handles `ftype == "histogram"` by creating **OTel Counters** for each sub-sample via `meter.create_counter(name)`
+3. This loses histogram semantics — OTel sees three independent counters, not a histogram
+4. The OTel SDK **may** auto-append `_total` to counter names (per OTel naming spec for monotonic sums)
+
+**Where does the `_total` get added?**
+
+Per OpenTelemetry Python SDK docs:
+- The **OTLP exporter** (gRPC/HTTP) does **NOT** add `_total` — metric names pass through as-is
+- The **Prometheus exporter** adds `_total` to counters when re-exporting to Prometheus format
+
+So if the suffix appears in dashboards, it's likely added by **NVCF's OTel Collector** when it re-exports to Prometheus on their side. The chain would be:
+```
+trtllm_e2e_request_latency_seconds_count    ← Prometheus text on worker
+→ e2e_request_latency_seconds_count         ← bridge strips prefix
+→ meter.create_counter("e2e_..._count")     ← OTel counter (no _total in OTLP wire)
+→ NVCF collector receives via OTLP          ← still no _total
+→ NVCF re-exports to Prometheus             ← _total appended by their Prometheus exporter
+→ e2e_request_latency_seconds_count_total   ← what appears in dashboard
+```
+
+**TODO**: Debug by inspecting the OTLP wire payload (enable `OTEL_LOG_LEVEL=debug` or use a local collector) to confirm whether `_total` is present before or after NVCF's collector.
+
+**Possible fixes** (once root cause confirmed):
+- If suffix is added downstream (NVCF side): nothing to fix in Dynamo — just rename in dashboard queries
+- If suffix is added by our SDK: use `ObservableGauge` instead of `Counter` for histogram sub-samples (gauges don't get `_total`), or drop `_bucket` export entirely (keep only `_count` and `_sum` which are the most useful for computing averages)
+
+---
+
 ## Key Source Files
 
 | File | Role |
